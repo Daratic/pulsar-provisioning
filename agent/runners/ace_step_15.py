@@ -7,6 +7,7 @@ import time
 import traceback
 
 from agent.runners.base import Runner, RunnerBusy
+from agent.runners.lyric_score_lite import LATENT_FRAMES_PER_SECOND, SCORE_WINDOW_FRAMES, dit_lyric_score, latent_frames
 # Imports librosa lazily, inside estimate_metas: a box without it gets no
 # metas (logged by _estimate_metas) rather than an agent that cannot start.
 from agent.runners.source_metas import estimate_metas
@@ -664,48 +665,96 @@ class AceStep15Runner(Runner):
             return None
 
     def _alignment_score(self, dit_handler, inputs: dict | None, call_params: dict) -> float | None:
-        """ACE-Step's lyric alignment score for this take, or None.
+        """ACE-Step's lyric alignment score (its dit_score) for this take, or None.
 
-        generate_music does not compute it. ACE-Step's own UI does, by passing
-        the result's extra_outputs to get_lyric_score; its dit_score scores the
-        generated latent (lm_score is the pure-noise baseline). Never raises -
-        an unscored take is still a take, and an out-of-memory here frees what
-        it can and leaves the score None.
+        generate_music does not compute it. ACE-Step's own UI calls
+        get_lyric_score, which scores a batch of two - pure noise and the take
+        - and on a 24 GB card ran out of memory beside the loaded models (run
+        6, 2026-10-16). dit_lyric_score is the same computation for the take
+        alone. If even that runs out of memory, the first SCORE_WINDOW_FRAMES
+        latent frames are scored once instead, and the log says so. Never
+        raises - an unscored take is still a take, and an out-of-memory frees
+        what it can and leaves the score None.
         """
         if inputs is None:
             return None
-        try:
-            torch = _torch()
-            context = contextlib.nullcontext()
-            if torch is not None:
+        torch = _torch()
+        if torch is not None:
+            try:
                 torch.cuda.empty_cache()
                 free, _total = torch.cuda.mem_get_info()
                 self._log(f"alignment: {free / GIB:.2f} GiB free on the GPU before scoring "
-                          f"(needs about {SCORER_NEEDS_GIB} GiB for a ~228 s source)")
-                # get_lyric_score carries @torch.inference_mode() upstream;
-                # stated here too so no autograd state is kept if that changes.
-                context = torch.inference_mode()
+                          f"(ACE-Step's batch-of-two scorer needed {SCORER_NEEDS_GIB} GiB more than it got "
+                          f"for a ~228 s source; this one scores the take alone)")
+            except Exception:
+                pass
+
+        score, oom = self._score_once(dit_handler, inputs, call_params, torch, window_frames=None)
+        if not oom:
+            return score
+        frames = latent_frames(inputs.get("pred_latent"))
+        if frames is not None and frames <= SCORE_WINDOW_FRAMES:
+            self._scoring_oom()
+            return None
+        _collect_and_empty_cache()
+        seconds = SCORE_WINDOW_FRAMES / LATENT_FRAMES_PER_SECOND
+        self._log(f"alignment: the whole take did not fit; scoring the first {SCORE_WINDOW_FRAMES} "
+                  f"latent frames (~{seconds:.0f} s) instead")
+        score, oom = self._score_once(dit_handler, inputs, call_params, torch, window_frames=SCORE_WINDOW_FRAMES)
+        if oom:
+            self._scoring_oom()
+        elif score is not None:
+            self._log(f"alignment: the score {score} is WINDOWED - it covers the first ~{seconds:.0f} s "
+                      f"of the take, not all of it")
+        return score
+
+    def _score_once(self, dit_handler, inputs: dict, call_params: dict, torch,
+                    window_frames: int | None) -> tuple[float | None, bool]:
+        """(score or None, ran out of memory). Never raises."""
+        span = "whole take" if window_frames is None else f"first {window_frames} frames"
+        context = contextlib.nullcontext()
+        if torch is not None:
+            try:
+                torch.cuda.reset_peak_memory_stats()
+            except Exception:
+                pass
+            # dit_lyric_score enters inference_mode itself; stated here too
+            # so nothing outside it keeps autograd state either.
+            context = torch.inference_mode()
+        try:
             with context:
-                outcome = dit_handler.get_lyric_score(
+                outcome = dit_lyric_score(
+                    dit_handler,
                     **inputs,
                     vocal_language=call_params.get("vocal_language") or "en",
                     inference_steps=int(call_params.get("inference_steps", TURBO_DEFAULTS["inference_steps"])),
                     seed=ALIGNMENT_SEED,
+                    window_frames=window_frames,
                 )
-            if not outcome.get("success"):
-                error = outcome.get("error")
-                self._log(f"alignment: get_lyric_score failed: {error}")
-                if _is_cuda_oom(error):
-                    self._scoring_oom()
-                return None
-            return float(outcome["dit_score"])
         except Exception as exc:
-            self._log(f"alignment: scoring raised {type(exc).__name__}: {exc}")
+            self._log(f"alignment: scoring the {span} raised {type(exc).__name__}: {exc}")
             oom = _is_cuda_oom(exc)
             traceback.clear_frames(exc.__traceback__)
-            if oom:
-                self._scoring_oom()
-            return None
+            del exc
+            self._log_scoring_peak(torch, span)
+            return None, oom
+        self._log_scoring_peak(torch, span)
+        if not outcome.get("success"):
+            error = outcome.get("error")
+            self._log(f"alignment: scoring the {span} failed: {error}")
+            return None, _is_cuda_oom(error)
+        return float(outcome["dit_score"]), False
+
+    def _log_scoring_peak(self, torch, span: str) -> None:
+        """The most PyTorch held at once while scoring - the number that says
+        how close the scorer came to the card's limit. Never raises."""
+        if torch is None:
+            return
+        try:
+            peak = torch.cuda.max_memory_allocated() / GIB
+            self._log(f"alignment: peak allocated while scoring the {span}: {peak:.2f} GiB")
+        except Exception:
+            pass
 
     def _scoring_oom(self) -> None:
         self._log("alignment: out of GPU memory; the take is kept without a score")
