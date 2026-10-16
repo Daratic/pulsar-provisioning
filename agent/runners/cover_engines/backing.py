@@ -57,41 +57,111 @@ def plan_windows(total_seconds: float, bpm: float, timesig: int, max_window_seco
     return windows
 
 
+# The melody conditioning, computed here rather than by transformers'
+# MusicgenMelodyFeatureExtractor: that class (and MusicgenMelodyProcessor,
+# which wraps it) is decorated @requires(backends=("torchaudio",)) and builds
+# a torchaudio Spectrogram, and the rented image's torch (2.14.1+cu130) has no
+# matching torchaudio wheel. The model itself does not import torchaudio.
+CHROMA_N_FFT = 16384
+CHROMA_HOP = 4096
+NUM_CHROMA = 12
+# config.chroma_length of facebook/musicgen-melody: 1 + 30 s * 32000 / 4096.
+CHROMA_LENGTH = 235
+
+
+def compute_chroma_features(audio_32k_mono, chroma_length: int = CHROMA_LENGTH):
+    """One-hot chroma, shape (chroma_length, 12), float32, for 32 kHz mono audio.
+
+    Mirrors MusicgenMelodyFeatureExtractor._torch_extract_fbank_features
+    (transformers 4.57):
+      * the audio is cut to 30 s (the extractor truncates to chunk_length *
+        sampling_rate), and audio shorter than n_fft is zero-padded on both
+        sides to n_fft;
+      * power-2 STFT, n_fft 16384, hop 4096, periodic Hann window, centred
+        with reflect padding, scaled by 1/sqrt(sum(window^2)) - what
+        torchaudio's Spectrogram(normalized=True, center=True) does;
+      * the chroma filterbank is librosa.filters.chroma(tuning=0), which is
+        the filterbank transformers' chroma_filter_bank was adapted from (they
+        agree to 3e-8 at these settings) - NOT librosa.feature.chroma_stft,
+        whose default estimates tuning and pads with zeros;
+      * each frame becomes a one-hot at its argmax chroma bin (the extractor
+        inf-normalises first, which never moves the argmax).
+    The extractor returns as many frames as the audio has (1 + samples //
+    hop) and the model then TILES a shorter sequence (repeat, not zeros) up to
+    config.chroma_length and crops a longer one. This function does that
+    tiling and cropping itself, so the model receives exactly chroma_length
+    frames and its own pad/crop is a no-op: the result equals the processor
+    path, not a zero-padded variant (zero rows are not an input the model
+    was trained on).
+    """
+    import librosa
+    import numpy as np
+
+    audio = np.asarray(audio_32k_mono, dtype="float32").reshape(-1)[: 30 * SAMPLE_RATE]
+    if audio.size == 0:
+        raise ValueError("no audio to compute chroma from")
+    if audio.size < CHROMA_N_FFT:
+        pad = CHROMA_N_FFT - audio.size
+        audio = np.pad(audio, (pad // 2, pad // 2 + pad % 2))
+    window = librosa.filters.get_window("hann", CHROMA_N_FFT, fftbins=True)
+    stft = librosa.stft(audio, n_fft=CHROMA_N_FFT, hop_length=CHROMA_HOP, win_length=CHROMA_N_FFT,
+                        window="hann", center=True, pad_mode="reflect")
+    power = (np.abs(stft) ** 2) / float(np.sum(window ** 2))
+    filters = librosa.filters.chroma(sr=SAMPLE_RATE, n_fft=CHROMA_N_FFT, tuning=0.0, n_chroma=NUM_CHROMA)
+    raw = filters @ power  # (12, frames)
+    frames = raw.shape[1]
+    one_hot = np.zeros((frames, NUM_CHROMA), dtype="float32")
+    one_hot[np.arange(frames), raw.argmax(axis=0)] = 1.0
+    if frames < chroma_length:
+        one_hot = np.tile(one_hot, (int(math.ceil(chroma_length / frames)), 1))
+    return one_hot[:chroma_length]
+
+
 def _default_load(model_id: str):  # pragma: no cover - needs torch, transformers and the weights
     import torch
-    from transformers import AutoProcessor, MusicgenMelodyForConditionalGeneration
+    from transformers import AutoTokenizer, MusicgenMelodyForConditionalGeneration
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float16 if device == "cuda" else torch.float32
-    processor = AutoProcessor.from_pretrained(model_id)
+    # The text tokenizer only: AutoProcessor would build the torchaudio-bound
+    # feature extractor.
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
     model = MusicgenMelodyForConditionalGeneration.from_pretrained(model_id, torch_dtype=dtype).to(device)
     model.eval()
     return {
-        "processor": processor,
+        "tokenizer": tokenizer,
         "model": model,
         "device": device,
         "dtype": dtype,
         "rate": int(model.config.audio_encoder.sampling_rate),
+        "chroma_length": int(getattr(model.config, "chroma_length", CHROMA_LENGTH)),
     }
 
 
-def _default_generate(handle, audio, text, max_new_tokens, guidance_scale):  # pragma: no cover - needs the model
+def _default_generate(handle, audio, text, max_new_tokens, guidance_scale):  # pragma: no cover - needs torch
     import torch
 
-    inputs = handle["processor"](
-        audio=audio, sampling_rate=SAMPLE_RATE, text=[text], padding=True, return_tensors="pt"
-    )
-    moved = {
-        key: (value.to(handle["device"], dtype=handle["dtype"]) if torch.is_floating_point(value)
-              else value.to(handle["device"]))
-        for key, value in inputs.items()
-    }
+    return generate_with(torch, handle, audio, text, max_new_tokens, guidance_scale)
+
+
+def generate_with(torch, handle, audio, text, max_new_tokens, guidance_scale):
+    """One window: text tokens + our chroma straight into model.generate.
+
+    `torch` is passed in so the call shape is testable without torch."""
+    chroma = compute_chroma_features(audio, handle.get("chroma_length", CHROMA_LENGTH))
+    tokens = handle["tokenizer"]([text], padding=True, return_tensors="pt")
+    input_features = torch.tensor(chroma)[None].to(handle["device"], dtype=handle["dtype"])
     with torch.inference_mode():
         out = handle["model"].generate(
-            **moved, do_sample=True, guidance_scale=guidance_scale, max_new_tokens=max_new_tokens
+            input_ids=tokens["input_ids"].to(handle["device"]),
+            attention_mask=tokens["attention_mask"].to(handle["device"]),
+            input_features=input_features,
+            do_sample=True,
+            guidance_scale=guidance_scale,
+            max_new_tokens=max_new_tokens,
         )
     wave = out[0, 0].float().cpu().numpy()
-    del out, moved, inputs
+    del out, input_features, tokens
     return resample(wave, handle["rate"], SAMPLE_RATE)
 
 
