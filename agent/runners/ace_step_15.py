@@ -1,9 +1,11 @@
+import gc
 import os
 import re
 import threading
 import time
+import traceback
 
-from agent.runners.base import Runner
+from agent.runners.base import Runner, RunnerBusy
 # Imports librosa lazily, inside estimate_metas: a box without it gets no
 # metas (logged by _estimate_metas) rather than an agent that cannot start.
 from agent.runners.source_metas import estimate_metas
@@ -132,6 +134,23 @@ PEAK_READ_ATTEMPTS = 3
 PEAK_READ_DELAY_SECONDS = 0.5
 
 
+def _free_gpu_memory() -> None:
+    """Give back what dropped handlers held on the GPU. Never raises.
+
+    Dropping the last reference is not enough on its own: the model tensors
+    can sit in reference cycles until gc runs, and PyTorch's caching allocator
+    keeps freed blocks reserved until empty_cache.
+    """
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 def _is_progress_bar(line: str) -> bool:
     """tqdm output, which is most of agent.log by volume and carries nothing
     we ever read. The step count it implies is available from generate_music's
@@ -168,15 +187,70 @@ class AceStep15Runner(Runner):
         self._metas_cache: dict[tuple[str, int], dict] = {}
         self._agent_log_path = os.path.join(workdir, "agent.log")
         self._sleep = time.sleep  # replaced in tests
+        # The loaded DiT and LM, kept for the whole session and keyed by
+        # (dit_model, lm_model, lm_backend). Building fresh handlers on every
+        # take put one more ~12 GB copy on the GPU per take and never freed
+        # the last one: session 3 on 2026-10-16 ran out of CUDA memory by its
+        # third take. It also paid a full model load per take, which is the
+        # cost a warm session exists to avoid.
+        self._dit_handler = None
+        self._llm_handler = None
+        self._handler_key: tuple[str, str, str] | None = None
+        # Guards the busy check and the thread start in submit together, so
+        # two simultaneous requests cannot both see "not running".
+        self._submit_lock = threading.Lock()
 
     def submit(self, input_path: str, params: dict) -> None:
-        # Set synchronously, before the thread exists: a session reuses this
-        # runner, and the previous job's "done" and output must not be
-        # readable by the first poll after a new dispatch.
-        self._status = "running"
-        self._output_path = None
-        self._scores = {}
-        threading.Thread(target=self._execute, args=(input_path, params), daemon=True).start()
+        with self._submit_lock:
+            # One take at a time. On 2026-10-16 a client that timed out and
+            # re-posted /submit started a second _execute beside the first;
+            # both loaded the model onto one GPU and one ended with meta
+            # tensors. The agent answers RunnerBusy with 409.
+            if self._status == "running":
+                raise RunnerBusy("a take is already running on this runner")
+            # Set synchronously, before the thread exists: a session reuses
+            # this runner, and the previous job's "done" and output must not
+            # be readable by the first poll after a new dispatch.
+            self._status = "running"
+            self._output_path = None
+            self._scores = {}
+            threading.Thread(target=self._execute, args=(input_path, params), daemon=True).start()
+
+    def _release_handlers(self) -> None:
+        """Drop the cached handlers and free the GPU memory they held."""
+        dit, llm = self._dit_handler, self._llm_handler
+        self._dit_handler = self._llm_handler = None
+        self._handler_key = None
+        del dit, llm
+        _free_gpu_memory()
+
+    def _handlers(self, params: dict):
+        """The DiT and LM for this take: loaded once per model set, reused after.
+
+        A failed initialisation is released, not cached, so the next take
+        tries again from a clean GPU.
+        """
+        dit_model = params.get("dit_model", DEFAULT_DIT_MODEL)
+        lm_model = params.get("lm_model", DEFAULT_LM_MODEL)
+        lm_backend = params.get("lm_backend", "pt")
+        key = (dit_model, lm_model, lm_backend)
+        if self._handler_key == key and self._dit_handler is not None and self._llm_handler is not None:
+            self._log(f"reusing loaded DiT/LM: dit_model={dit_model} lm_model={lm_model} backend={lm_backend}")
+            return self._dit_handler, self._llm_handler
+        if self._dit_handler is not None or self._llm_handler is not None:
+            self._log(f"model set changed from {self._handler_key} to {key}: releasing the loaded DiT/LM")
+            self._release_handlers()
+        try:
+            dit_handler, llm_handler = self._load_handlers(dit_model, lm_model, lm_backend)
+        except Exception as exc:
+            # Whatever the failed load left behind - possibly a half-loaded
+            # model - must not stay on the GPU for the next take. The
+            # traceback's frames still reference it, so clear them first.
+            traceback.clear_frames(exc.__traceback__)
+            self._release_handlers()
+            raise
+        self._dit_handler, self._llm_handler, self._handler_key = dit_handler, llm_handler, key
+        return dit_handler, llm_handler
 
     def _execute(self, input_path: str, params: dict) -> None:
         self._status = "running"
@@ -191,68 +265,7 @@ class AceStep15Runner(Runner):
             os.makedirs(output_dir, exist_ok=True)
 
             dit_model = params.get("dit_model", DEFAULT_DIT_MODEL)
-            # Logged explicitly: a handler that fails to find its checkpoint
-            # and initialises random weights produces correctly-shaped,
-            # correctly-normalised noise - indistinguishable from a bad
-            # generation unless we record what was actually loaded.
-            self._log(f"init DiT project_root={PROJECT_ROOT} config_path={dit_model} device=cuda")
-            # Two different directories, and confusing them cost us a lot of
-            # time. initialize_service derives its own checkpoint dir as
-            # project_root/checkpoints; CHECKPOINT_DIR is only ever where we
-            # place the 5Hz LM by hand. Logging the LM's directory alone made
-            # "1 entries" read as a missing DiT checkpoint when it was simply
-            # a directory the DiT never looks at.
-            dit_checkpoint_dir = os.path.join(PROJECT_ROOT, "checkpoints")
-            self._log(f"DiT checkpoint dir {dit_checkpoint_dir}: {self._describe(dit_checkpoint_dir)}")
-            self._log(f"LM checkpoint dir {CHECKPOINT_DIR}: {self._describe(CHECKPOINT_DIR)}")
-            dit_handler = AceStepHandler()
-            # initialize_service returns (message, ok) exactly like the LM's
-            # initialize, and on a precheck failure it sets model, vae and
-            # text_encoder to None and RETURNS rather than raising. Discarding
-            # that is the same mistake that let the 5Hz LM silently not load:
-            # generation then runs with nothing behind the handler and decodes
-            # to near-silence, which enable_normalization amplifies into
-            # full-scale noise. The message names the resolved model, VAE and
-            # text-encoder paths, so it is also the only direct record of what
-            # was actually loaded.
-            dit_message, dit_ok = dit_handler.initialize_service(
-                project_root=PROJECT_ROOT,
-                config_path=dit_model,
-                device="cuda",
-            )
-            self._log(f"DiT initialise ok={dit_ok!r}: {dit_message}")
-            if not dit_ok:
-                raise RuntimeError(
-                    f"DiT failed to initialise (config_path={dit_model!r}): "
-                    f"{dit_message}. Generation without it produces noise."
-                )
-            llm_handler = LLMHandler()
-            # initialize() returns (message, ok). Its result was previously
-            # discarded, which let a failed LM initialisation pass silently -
-            # and everything downstream then ran without the planning model.
-            lm_message, lm_ok = llm_handler.initialize(
-                checkpoint_dir=CHECKPOINT_DIR,
-                lm_model_path=params.get("lm_model", DEFAULT_LM_MODEL),
-                # "pt", NOT "pytorch". The valid values are "vllm", "pt" and
-                # "mlx"; anything else matches no branch, leaves
-                # llm_initialized False, and returns ok=False. We passed
-                # "pytorch" and discarded the result, so the 5Hz LM never
-                # loaded at all - which is why text2music produced noise and
-                # why the caption had no audible effect on covers
-                # (generate_music logged need_lm_for_cot=True with
-                # llm_initialized=False, so the chain-of-thought caption
-                # processing was skipped entirely).
-                backend=params.get("lm_backend", "pt"),
-                device="cuda",
-            )
-            self._log(f"LM initialise ok={lm_ok!r}: {lm_message}")
-            if not lm_ok:
-                # Loudly, rather than generating without the planning model.
-                raise RuntimeError(
-                    f"5Hz LM failed to initialise (backend="
-                    f"{params.get('lm_backend', 'pt')!r}): {lm_message}. "
-                    "Generation without it produces noise."
-                )
+            dit_handler, llm_handler = self._handlers(params)
 
             task_type = params.get("task_type", "cover")
             call_params = {
@@ -387,6 +400,72 @@ class AceStep15Runner(Runner):
             self._status = "failed"
             self._output_path = None
             self._log(f"_execute failed: {exc}")
+
+    def _load_handlers(self, dit_model: str, lm_model: str, lm_backend: str):
+        """Build and initialise a DiT and LM. Raises if either fails."""
+        # Logged explicitly: a handler that fails to find its checkpoint
+        # and initialises random weights produces correctly-shaped,
+        # correctly-normalised noise - indistinguishable from a bad
+        # generation unless we record what was actually loaded.
+        self._log(f"init DiT project_root={PROJECT_ROOT} config_path={dit_model} device=cuda")
+        # Two different directories, and confusing them cost us a lot of
+        # time. initialize_service derives its own checkpoint dir as
+        # project_root/checkpoints; CHECKPOINT_DIR is only ever where we
+        # place the 5Hz LM by hand. Logging the LM's directory alone made
+        # "1 entries" read as a missing DiT checkpoint when it was simply
+        # a directory the DiT never looks at.
+        dit_checkpoint_dir = os.path.join(PROJECT_ROOT, "checkpoints")
+        self._log(f"DiT checkpoint dir {dit_checkpoint_dir}: {self._describe(dit_checkpoint_dir)}")
+        self._log(f"LM checkpoint dir {CHECKPOINT_DIR}: {self._describe(CHECKPOINT_DIR)}")
+        dit_handler = AceStepHandler()
+        # initialize_service returns (message, ok) exactly like the LM's
+        # initialize, and on a precheck failure it sets model, vae and
+        # text_encoder to None and RETURNS rather than raising. Discarding
+        # that is the same mistake that let the 5Hz LM silently not load:
+        # generation then runs with nothing behind the handler and decodes
+        # to near-silence, which enable_normalization amplifies into
+        # full-scale noise. The message names the resolved model, VAE and
+        # text-encoder paths, so it is also the only direct record of what
+        # was actually loaded.
+        dit_message, dit_ok = dit_handler.initialize_service(
+            project_root=PROJECT_ROOT,
+            config_path=dit_model,
+            device="cuda",
+        )
+        self._log(f"DiT initialise ok={dit_ok!r}: {dit_message}")
+        if not dit_ok:
+            raise RuntimeError(
+                f"DiT failed to initialise (config_path={dit_model!r}): "
+                f"{dit_message}. Generation without it produces noise."
+            )
+        llm_handler = LLMHandler()
+        # initialize() returns (message, ok). Its result was previously
+        # discarded, which let a failed LM initialisation pass silently -
+        # and everything downstream then ran without the planning model.
+        lm_message, lm_ok = llm_handler.initialize(
+            checkpoint_dir=CHECKPOINT_DIR,
+            lm_model_path=lm_model,
+            # "pt", NOT "pytorch". The valid values are "vllm", "pt" and
+            # "mlx"; anything else matches no branch, leaves
+            # llm_initialized False, and returns ok=False. We passed
+            # "pytorch" and discarded the result, so the 5Hz LM never
+            # loaded at all - which is why text2music produced noise and
+            # why the caption had no audible effect on covers
+            # (generate_music logged need_lm_for_cot=True with
+            # llm_initialized=False, so the chain-of-thought caption
+            # processing was skipped entirely).
+            backend=lm_backend,
+            device="cuda",
+        )
+        self._log(f"LM initialise ok={lm_ok!r}: {lm_message}")
+        if not lm_ok:
+            # Loudly, rather than generating without the planning model.
+            raise RuntimeError(
+                f"5Hz LM failed to initialise (backend="
+                f"{lm_backend!r}): {lm_message}. "
+                "Generation without it produces noise."
+            )
+        return dit_handler, llm_handler
 
     def scores(self) -> dict:
         return dict(self._scores)

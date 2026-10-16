@@ -1,9 +1,16 @@
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
-from agent.runners.base import Runner
+from agent.runners.base import Runner, RunnerBusy
 from agent.runners.seed_vc import SeedVCRunner
+
+
+def _busy() -> JSONResponse:
+    """A take is already running. 409, never a second take: a client that
+    timed out and re-posted /submit on 2026-10-16 started two model loads on
+    one GPU. The client reads 409 as "your earlier submit landed"."""
+    return JSONResponse(status_code=409, content={"accepted": False, "reason": "busy"})
 
 
 class SubmitRequest(BaseModel):
@@ -15,8 +22,11 @@ def create_agent_app(runner: Runner) -> FastAPI:
     agent_app = FastAPI(title="pulsar-agent")
 
     @agent_app.post("/submit")
-    def submit(request: SubmitRequest) -> dict:
-        runner.submit(request.input_path, request.params)
+    def submit(request: SubmitRequest):
+        try:
+            runner.submit(request.input_path, request.params)
+        except RunnerBusy:
+            return _busy()
         return {"accepted": True}
 
     @agent_app.get("/status")
@@ -78,8 +88,11 @@ def create_multi_runner_app(registry) -> FastAPI:
         return {"runners": registry.names()}
 
     @agent_app.post("/submit")
-    def submit(request: MultiRunnerSubmitRequest) -> dict:
-        _runner(request.runner).submit(request.input_path, request.params)
+    def submit(request: MultiRunnerSubmitRequest):
+        try:
+            _runner(request.runner).submit(request.input_path, request.params)
+        except RunnerBusy:
+            return _busy()
         return {"accepted": True}
 
     @agent_app.get("/status")

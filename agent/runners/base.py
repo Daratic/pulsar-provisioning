@@ -1,6 +1,14 @@
 from abc import ABC, abstractmethod
 
 
+class RunnerBusy(RuntimeError):
+    """A submit arrived while this runner was already running a take.
+
+    The agent answers it with 409. Starting a second take instead is what
+    put two ~12 GB model loads on one GPU at once on 2026-10-16.
+    """
+
+
 class Runner(ABC):
     @abstractmethod
     def submit(self, input_path: str, params: dict) -> None:
