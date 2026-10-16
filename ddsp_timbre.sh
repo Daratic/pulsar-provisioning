@@ -15,9 +15,10 @@ tar -xzf /tmp/pulsar-agent.tar.gz -C /opt/apps/pulsar --strip-components=1 --wil
 test -f /opt/apps/pulsar/agent/agent_server_multi.py
 pip install fastapi==0.115.0 'uvicorn[standard]==0.32.0' pydantic==2.9.2 soundfile
 pip install uv==0.12.20
-uv venv --python 3.10 /opt/ddsp/venv
-uv pip install --python /opt/ddsp/venv/bin/python pip 'setuptools<80' wheel 'numpy<1.24'
-/opt/ddsp/venv/bin/python -m pip install --no-build-isolation tensorflow==2.11.0 tensorflow-probability==0.19.0 ddsp==3.7.0 'numpy<1.24' protobuf==3.19.6 crepe==0.0.12 'librosa<=0.10' soundfile
+uv venv --clear --python 3.10 /opt/ddsp/venv
+uv pip install --python /opt/ddsp/venv/bin/python pip 'setuptools<80' wheel 'numpy<1.24' pybind11
+/opt/ddsp/venv/bin/python -m pip install --no-build-isolation tensorflow==2.11.0 tensorflow-probability==0.19.0 tensorflow-datasets==4.9.0 'numpy<1.24' protobuf==3.19.6 crepe==0.0.12 'librosa<=0.10' 'scipy<=1.10.1' 'gin-config>=0.3.0' absl-py 'hmmlearn<=0.2.7' 'mir-eval<=0.7' 'note-seq<0.0.4' 'dill<=0.3.4' 'pydub<=0.25.1' future six soundfile
+/opt/ddsp/venv/bin/python -m pip install --no-deps ddsp==3.7.0
 mkdir -p /opt/ddsp/models/tenor_saxophone
 curl -fsSL --retry 3 -o /opt/ddsp/models/tenor_saxophone/operative_config-0.gin https://storage.googleapis.com/ddsp/models/timbre_transfer_colab/2021-07-08/solo_tenor_saxophone_ckpt/operative_config-0.gin
 curl -fsSL --retry 3 -o /opt/ddsp/models/tenor_saxophone/dataset_statistics.pkl https://storage.googleapis.com/ddsp/models/timbre_transfer_colab/2021-07-08/solo_tenor_saxophone_ckpt/dataset_statistics.pkl
