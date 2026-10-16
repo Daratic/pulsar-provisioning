@@ -13,7 +13,7 @@ mkdir -p /opt/apps/pulsar
 curl -fsSL --retry 3 --retry-delay 5 -o /tmp/pulsar-agent.tar.gz "https://codeload.github.com/Daratic/pulsar-provisioning/tar.gz/${PULSAR_AGENT_REF}"
 tar -xzf /tmp/pulsar-agent.tar.gz -C /opt/apps/pulsar --strip-components=1 --wildcards '*/agent/*'
 test -f /opt/apps/pulsar/agent/agent_server_multi.py
-pip install fastapi==0.115.0 'uvicorn[standard]==0.32.0' pydantic==2.9.2 soundfile torchcodec huggingface_hub 'transformers>=4.51.0,<4.58.0' 'diffusers>=0.37.0' 'accelerate>=1.12.0' 'vector-quantize-pytorch>=1.27.15' 'torchao>=0.16.0,<0.17.0' 'pytorch-wavelets>=1.3.0' 'pywavelets>=1.9.0' 'numba>=0.63.1' 'typer-slim>=0.21.1' diskcache 'loguru>=0.7.3' 'einops>=0.8.1' 'scipy>=1.10.1' toml
+pip install fastapi==0.115.0 'uvicorn[standard]==0.32.0' pydantic==2.9.2 soundfile torchcodec huggingface_hub 'transformers>=4.51.0,<4.58.0' 'diffusers>=0.37.0' 'accelerate>=1.12.0' 'vector-quantize-pytorch>=1.27.15' 'torchao>=0.16.0,<0.17.0' 'pytorch-wavelets>=1.3.0' 'pywavelets>=1.9.0' 'numba>=0.63.1' 'typer-slim>=0.21.1' diskcache 'loguru>=0.7.3' 'einops>=0.8.1' 'scipy>=1.10.1' toml librosa==0.11.0
 git clone --depth 1 https://github.com/ace-step/ACE-Step-1.5.git /opt/ACE-Step-1.5 || (sleep 5; rm -rf /opt/ACE-Step-1.5; git clone --depth 1 https://github.com/ace-step/ACE-Step-1.5.git /opt/ACE-Step-1.5) || (sleep 15; rm -rf /opt/ACE-Step-1.5; git clone --depth 1 https://github.com/ace-step/ACE-Step-1.5.git /opt/ACE-Step-1.5)
 pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 --index-url https://download.pytorch.org/whl/cu128
 python3 -c "import torch; print('torch now', torch.__version__, 'cuda', torch.cuda.is_available()); raise SystemExit(0 if torch.cuda.is_available() else 'CUDA lost after torch swap')"

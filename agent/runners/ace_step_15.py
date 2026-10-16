@@ -1,7 +1,12 @@
 import os
+import re
 import threading
+import time
 
 from agent.runners.base import Runner
+# Imports librosa lazily, inside estimate_metas: a box without it gets no
+# metas (logged by _estimate_metas) rather than an agent that cannot start.
+from agent.runners.source_metas import estimate_metas
 
 # Why the import failed, if it did. Without this the names below are simply
 # None and the first call reports "'NoneType' object is not callable" - which
@@ -101,6 +106,26 @@ OPTIONAL_PARAMS = (
     "fade_out_duration",
 )
 
+# Estimated from the source for a cover when the caller did not set them.
+META_KEYS = ("bpm", "keyscale", "timesignature")
+
+# ACE-Step logs the peak it is about to normalise away (acestep/inference.py,
+# loguru, to stderr - which Supervisor writes into agent.log). A peak far
+# below 1.0 is the August near-silence: 0.0041 amplified ~217x into "noise".
+PEAK_LINE_RE = re.compile(r"\[Normalization\] Audio 0 BEFORE: Peak=([0-9]*\.?[0-9]+)")
+# What get_lyric_score needs, from GenerationResult.extra_outputs. Each is
+# batched; batch_size is 1, so sample 0 is this take.
+ALIGNMENT_TENSOR_KEYS = (
+    "pred_latents", "encoder_hidden_states", "encoder_attention_mask", "context_latents", "lyric_token_idss",
+)
+# The seed ACE-Step's own UI scores with, so our numbers compare with its.
+ALIGNMENT_SEED = 42
+# loguru -> stderr -> supervisor -> agent.log can land a moment after
+# generate_music returns, so a missing peak line is read again before it is
+# given up as None.
+PEAK_READ_ATTEMPTS = 3
+PEAK_READ_DELAY_SECONDS = 0.5
+
 
 def _is_progress_bar(line: str) -> bool:
     """tqdm output, which is most of agent.log by volume and carries nothing
@@ -130,6 +155,11 @@ class AceStep15Runner(Runner):
         self._status = "idle"
         self._output_path: str | None = None
         self._log_path = os.path.join(workdir, "job.log")
+        # One runner object serves a whole session, so these are reset at the
+        # start of every take - a failed take must not show the last one's.
+        self._scores: dict = {}
+        self._agent_log_path = os.path.join(workdir, "agent.log")
+        self._sleep = time.sleep  # replaced in tests
 
     def submit(self, input_path: str, params: dict) -> None:
         # Set synchronously, before the thread exists: a session reuses this
@@ -141,6 +171,7 @@ class AceStep15Runner(Runner):
 
     def _execute(self, input_path: str, params: dict) -> None:
         self._status = "running"
+        self._scores = {}
         try:
             if AceStepHandler is None:
                 raise RuntimeError(
@@ -285,6 +316,16 @@ class AceStep15Runner(Runner):
             for optional in OPTIONAL_PARAMS:
                 if optional in params:
                     call_params[optional] = params[optional]
+            # A cover always matches existing material, which is exactly when
+            # ACE-Step's tutorial says to set these anchors. Only the ones the
+            # caller left out; text2music has no source to measure.
+            if task_type != "text2music":
+                missing = [key for key in META_KEYS if key not in params]
+                if missing:
+                    metas = self._estimate_metas(input_path)
+                    for key in missing:
+                        if key in metas:
+                            call_params[key] = metas[key]
 
             config = GenerationConfig(
                 # Default is 2, i.e. two full renders per call. We pay by the
@@ -298,6 +339,7 @@ class AceStep15Runner(Runner):
             self._log("generation params: " + ", ".join(
                 f"{k}={v!r}" for k, v in sorted(call_params.items()) if k != "lyrics"))
             self._log(f"lyrics: {len(call_params['lyrics'])} chars")
+            log_offset = self._agent_log_size()
             result = generate_music(
                 dit_handler, llm_handler, GenerationParams(**call_params), config, save_dir=output_dir
             )
@@ -316,6 +358,16 @@ class AceStep15Runner(Runner):
             # "done" with no retrievable audio is the worst outcome, because
             # the orchestrator then destroys the instance.
             if path and os.path.exists(path):
+                # Scored BEFORE status flips: the worker reads the scores the
+                # moment it sees "done". The peak is read last, after the file
+                # is written and the alignment is scored, to give ACE-Step's
+                # log line the most time to reach agent.log.
+                alignment_score = self._alignment_score(dit_handler, result, call_params)
+                self._scores = {
+                    "alignment_score": alignment_score,
+                    "peak_before_norm": self._read_peak(log_offset),
+                }
+                self._log(f"scores: {self._scores}")
                 self._output_path = path
                 self._status = "done"
             else:
@@ -326,6 +378,87 @@ class AceStep15Runner(Runner):
             self._status = "failed"
             self._output_path = None
             self._log(f"_execute failed: {exc}")
+
+    def scores(self) -> dict:
+        return dict(self._scores)
+
+    def _agent_log_size(self) -> int:
+        try:
+            return os.path.getsize(self._agent_log_path)
+        except OSError:
+            return 0
+
+    def _estimate_metas(self, input_path: str) -> dict:
+        """Never raises: a take without anchors is still a take."""
+        try:
+            metas = estimate_metas(input_path)
+        except Exception as exc:
+            self._log(f"metas: could not estimate from the source ({type(exc).__name__}: {exc})")
+            return {}
+        self._log(f"metas estimated from the source: {metas}")
+        return metas
+
+    def _read_peak(self, offset: int) -> float | None:
+        """_peak_since, retried briefly while agent.log exists but lacks the line."""
+        for attempt in range(PEAK_READ_ATTEMPTS):
+            peak = self._peak_since(offset)
+            if peak is not None or not os.path.exists(self._agent_log_path):
+                return peak
+            if attempt < PEAK_READ_ATTEMPTS - 1:
+                try:
+                    self._sleep(PEAK_READ_DELAY_SECONDS)
+                except Exception:
+                    return None
+        return None
+
+    def _peak_since(self, offset: int) -> float | None:
+        """The peak ACE-Step logged while making THIS take.
+
+        agent.log carries every take of the session, so only what was written
+        after `offset` is read, and the last match wins.
+        """
+        try:
+            with open(self._agent_log_path, "rb") as log_file:
+                size = os.fstat(log_file.fileno()).st_size
+                log_file.seek(offset if offset <= size else 0)
+                text = log_file.read().decode("utf-8", errors="replace")
+        except OSError:
+            return None
+        matches = PEAK_LINE_RE.findall(text)
+        return float(matches[-1]) if matches else None
+
+    def _alignment_score(self, dit_handler, result, call_params: dict) -> float | None:
+        """ACE-Step's lyric alignment score for this take, or None.
+
+        generate_music does not compute it. ACE-Step's own UI does, by passing
+        the result's extra_outputs to get_lyric_score; its dit_score scores the
+        generated latent (lm_score is the pure-noise baseline). Never raises -
+        an unscored take is still a take.
+        """
+        if not (call_params.get("lyrics") or "").strip():
+            return None
+        try:
+            extra = getattr(result, "extra_outputs", None) or {}
+            if any(extra.get(key) is None for key in ALIGNMENT_TENSOR_KEYS):
+                self._log("alignment: extra_outputs lacks the tensors to score with")
+                return None
+            outcome = dit_handler.get_lyric_score(
+                pred_latent=extra["pred_latents"][0:1],
+                encoder_hidden_states=extra["encoder_hidden_states"][0:1],
+                encoder_attention_mask=extra["encoder_attention_mask"][0:1],
+                context_latents=extra["context_latents"][0:1],
+                lyric_token_ids=extra["lyric_token_idss"][0:1],
+                vocal_language=call_params.get("vocal_language") or "en",
+                inference_steps=int(call_params.get("inference_steps", TURBO_DEFAULTS["inference_steps"])),
+                seed=ALIGNMENT_SEED,
+            )
+            if not outcome.get("success"):
+                self._log(f"alignment: get_lyric_score failed: {outcome.get('error')}")
+                return None
+            return float(outcome["dit_score"])
+        except Exception as exc:
+            self._log(f"alignment: scoring raised {type(exc).__name__}: {exc}")
+            return None
 
     @staticmethod
     def _describe(path: str) -> str:

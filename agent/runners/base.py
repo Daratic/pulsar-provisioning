@@ -17,3 +17,7 @@ class Runner(ABC):
     @abstractmethod
     def log_tail(self, lines: int = 100) -> str:
         ...
+
+    def scores(self) -> dict:
+        """Signals for ranking this runner's last output. Most runners have none."""
+        return {}

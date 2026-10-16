@@ -96,6 +96,11 @@ def create_multi_runner_app(registry) -> FastAPI:
         # to name what it retrieves (MIDI is not a .wav).
         return {"output_path": _runner(runner).output_path()}
 
+    @agent_app.get("/scores")
+    def scores(runner: str) -> dict:
+        """Ranking signals for the runner's last output - {} if it has none."""
+        return _runner(runner).scores()
+
     @agent_app.get("/output")
     def output(runner: str) -> FileResponse:
         path = _runner(runner).output_path()
