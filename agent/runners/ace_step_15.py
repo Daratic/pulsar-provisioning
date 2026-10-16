@@ -1,3 +1,4 @@
+import contextlib
 import gc
 import os
 import re
@@ -134,6 +135,34 @@ PEAK_READ_ATTEMPTS = 3
 PEAK_READ_DELAY_SECONDS = 0.5
 
 
+# What get_lyric_score allocated on top of the loaded models for a ~228 s
+# source, from the OOM it raised in session 5 (2026-10-16). Logged beside the
+# free memory before scoring, so a scoring OOM can be read at a glance.
+SCORER_NEEDS_GIB = 8.25
+GIB = 2 ** 30
+
+
+def _torch():
+    """torch if it is importable and has a GPU to talk to, else None."""
+    try:
+        import torch
+
+        return torch if torch.cuda.is_available() else None
+    except Exception:
+        return None
+
+
+def _collect_and_empty_cache() -> None:
+    """gc, then hand PyTorch's cached blocks back to the driver. Never raises."""
+    gc.collect()
+    try:
+        torch = _torch()
+        if torch is not None:
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 def _free_gpu_memory() -> None:
     """Give back what dropped handlers held on the GPU. Never raises.
 
@@ -141,14 +170,45 @@ def _free_gpu_memory() -> None:
     can sit in reference cycles until gc runs, and PyTorch's caching allocator
     keeps freed blocks reserved until empty_cache.
     """
-    gc.collect()
-    try:
-        import torch
+    _collect_and_empty_cache()
 
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+
+def _free_take_memory() -> None:
+    """Give back what one take's generation and scoring left on the GPU.
+
+    Runs after every take, success or failure. Session 5 on 2026-10-16 kept
+    ~20-22 GiB allocated after a take - the models' ~12 GiB plus the take's
+    leftovers - so the scorer could not get its 8.25 GiB and the next take
+    could not generate at all. Separate from _free_gpu_memory, which is the
+    release of the models themselves.
+    """
+    _collect_and_empty_cache()
+
+
+def _gpu_memory_summary() -> str | None:
+    """'allocated=X GiB free=Y GiB', or None without a GPU. Never raises."""
+    try:
+        torch = _torch()
+        if torch is None:
+            return None
+        free, _total = torch.cuda.mem_get_info()
+        return f"allocated={torch.cuda.memory_allocated() / GIB:.2f} GiB free={free / GIB:.2f} GiB"
     except Exception:
-        pass
+        return None
+
+
+def _is_cuda_oom(error) -> bool:
+    """A CUDA out-of-memory, given as an exception or as an error message.
+
+    Both forms occur: generate_music and get_lyric_score catch RuntimeError -
+    which torch.OutOfMemoryError is - and hand it back as text.
+    """
+    if error is None:
+        return False
+    if isinstance(error, BaseException) and any(
+            cls.__name__ == "OutOfMemoryError" for cls in type(error).__mro__):
+        return True
+    return "out of memory" in str(error).lower()
 
 
 def _is_progress_bar(line: str) -> bool:
@@ -196,6 +256,10 @@ class AceStep15Runner(Runner):
         self._dit_handler = None
         self._llm_handler = None
         self._handler_key: tuple[str, str, str] | None = None
+        # Whether THIS take is running on handlers an earlier take loaded. An
+        # OOM on reused handlers means earlier takes left the GPU short, so
+        # the handlers are released; an OOM on fresh ones is just a failure.
+        self._reused_handlers = False
         # Guards the busy check and the thread start in submit together, so
         # two simultaneous requests cannot both see "not running".
         self._submit_lock = threading.Lock()
@@ -236,6 +300,7 @@ class AceStep15Runner(Runner):
         key = (dit_model, lm_model, lm_backend)
         if self._handler_key == key and self._dit_handler is not None and self._llm_handler is not None:
             self._log(f"reusing loaded DiT/LM: dit_model={dit_model} lm_model={lm_model} backend={lm_backend}")
+            self._reused_handlers = True
             return self._dit_handler, self._llm_handler
         if self._dit_handler is not None or self._llm_handler is not None:
             self._log(f"model set changed from {self._handler_key} to {key}: releasing the loaded DiT/LM")
@@ -253,153 +318,199 @@ class AceStep15Runner(Runner):
         return dit_handler, llm_handler
 
     def _execute(self, input_path: str, params: dict) -> None:
+        """One take, then give back everything it put on the GPU.
+
+        The take runs in _run_take so that its locals - the generation result,
+        decoded audio, the scorer's inputs - die with that frame, before the
+        cleanup in `finally` runs. A local of THIS frame would still be alive
+        during the cleanup and keep its tensors.
+        """
         self._status = "running"
         self._scores = {}
+        self._reused_handlers = False
         try:
-            if AceStepHandler is None:
-                raise RuntimeError(
-                    "ACE-Step 1.5 is installed but could not be imported by this runner. "
-                    f"Underlying import error: {IMPORT_ERROR}"
-                )
-            output_dir = os.path.join(self._workdir, "output")
-            os.makedirs(output_dir, exist_ok=True)
-
-            dit_model = params.get("dit_model", DEFAULT_DIT_MODEL)
-            dit_handler, llm_handler = self._handlers(params)
-
-            task_type = params.get("task_type", "cover")
-            call_params = {
-                # Overridable so text2music can be run as a control: if the
-                # caption produces music from nothing but is ignored in cover
-                # mode, the problem is the cover path, not the prompt.
-                "task_type": task_type,
-                # src_audio is the song being covered; reference_audio is the
-                # STYLE it should take on. They are different inputs doing
-                # different jobs, which the source docstrings say plainly:
-                # reference_audio is "for style transfer or cover tasks",
-                # src_audio is "for audio-to-audio tasks".
-                #
-                # Setting both to the same file - which this did briefly -
-                # asks the model to make a track sound like itself, and it
-                # duly returns something close to the original. Pointing
-                # reference_audio at a track in the TARGET style is what
-                # actually transfers a style.
-                #
-                # Falls back to the source when no style reference is given,
-                # so a prompt-only cover still works.
-                "caption": params.get("prompt") or "",
-                # Left empty, ACE-Step renders the cover as an instrumental -
-                # the exact mistake that made job 20's vocals unintelligible.
-                "lyrics": params.get("lyrics") or "",
-                # Stated rather than inherited: this is what stops a repeat of
-                # job 20's clipping, so it should be visible at the call site.
-                "enable_normalization": True,
-                "normalization_db": -1.0,
-            }
-            # text2music generates from the caption alone. It is here as a
-            # control - "can this stack make music from nothing?" - and
-            # conditioning it on the very track under suspicion would defeat
-            # that, so the audio inputs are omitted entirely rather than
-            # passed and hopefully ignored.
-            if task_type != "text2music":
-                call_params["src_audio"] = input_path
-                # Only when a real style reference was given. This used to
-                # fall back to input_path, which set reference_audio ==
-                # src_audio and asked the model to make the track sound like
-                # itself - the trap this file already documents from job 74,
-                # walked into by the fallback itself. Job 78 came back as the
-                # source almost unchanged.
-                #
-                # With no reference, the caption is the only style signal,
-                # which is what a prompt-driven cover is meant to be.
-                if params.get("reference_path"):
-                    call_params["reference_audio"] = params["reference_path"]
-                # Both of these only mean anything when there IS a source
-                # audio. cover_noise_strength is documented as "0=pure noise
-                # (no cover), 1=closest to src audio", and it also sets where
-                # on the schedule the diffusion starts - at 0.6 only 40% of
-                # the steps run.
-                #
-                # Sending it for text2music, which has no source, asked the
-                # sampler to start 60% of the way towards silence and then
-                # denoise for 3 of 8 steps. It returned very nearly what it
-                # started with: job 76 decoded to Peak=0.0041, which
-                # enable_normalization multiplied by ~217 to hit -1dB. That
-                # is the "noise" - not a bad generation, but silence with the
-                # gain turned all the way up.
-                call_params["audio_cover_strength"] = params.get(
-                    "audio_cover_strength", DEFAULT_COVER_STRENGTH)
-                call_params["cover_noise_strength"] = params.get(
-                    "cover_noise_strength", DEFAULT_COVER_NOISE_STRENGTH)
-
-            # Turbo's own schedule, unless the job explicitly says otherwise.
-            if "turbo" in dit_model:
-                call_params.update(TURBO_DEFAULTS)
-            for optional in OPTIONAL_PARAMS:
-                if optional in params:
-                    call_params[optional] = params[optional]
-            # A cover always matches existing material, which is exactly when
-            # ACE-Step's tutorial says to set these anchors. Only the ones the
-            # caller left out; text2music has no source to measure.
-            if task_type != "text2music":
-                missing = [key for key in META_KEYS if key not in params]
-                if missing:
-                    metas = self._estimate_metas(input_path)
-                    for key in missing:
-                        if key in metas:
-                            call_params[key] = metas[key]
-
-            config = GenerationConfig(
-                # Default is 2, i.e. two full renders per call. We pay by the
-                # second and only ever retrieve one file.
-                batch_size=1,
-                # Default is flac; app/audio_quality.py reads 16-bit PCM wave,
-                # and it gates delivery.
-                audio_format="wav",
-            )
-
-            self._log("generation params: " + ", ".join(
-                f"{k}={v!r}" for k, v in sorted(call_params.items()) if k != "lyrics"))
-            self._log(f"lyrics: {len(call_params['lyrics'])} chars")
-            log_offset = self._agent_log_size()
-            result = generate_music(
-                dit_handler, llm_handler, GenerationParams(**call_params), config, save_dir=output_dir
-            )
-            self._log(f"generation returned success={getattr(result, 'success', None)!r} "
-                      f"audios={len(getattr(result, 'audios', None) or [])}")
-
-            if not getattr(result, "success", False):
-                self._log(f"generation reported failure: {getattr(result, 'error', 'no error given')}")
-                self._status = "failed"
-                self._output_path = None
-                return
-
-            audios = getattr(result, "audios", None) or []
-            path = audios[0]["path"] if audios else None
-            # Trust the filesystem over the reported path: a job that claims
-            # "done" with no retrievable audio is the worst outcome, because
-            # the orchestrator then destroys the instance.
-            if path and os.path.exists(path):
-                # Scored BEFORE status flips: the worker reads the scores the
-                # moment it sees "done". The peak is read last, after the file
-                # is written and the alignment is scored, to give ACE-Step's
-                # log line the most time to reach agent.log.
-                alignment_score = self._alignment_score(dit_handler, result, call_params)
-                self._scores = {
-                    "alignment_score": alignment_score,
-                    "peak_before_norm": self._read_peak(log_offset),
-                }
-                self._log(f"scores: {self._scores}")
-                self._output_path = path
-                self._status = "done"
-            else:
-                self._log(f"generation reported success but no file at {path!r}")
-                self._status = "failed"
-                self._output_path = None
+            self._run_take(input_path, params)
         except Exception as exc:
             self._status = "failed"
             self._output_path = None
             self._log(f"_execute failed: {exc}")
+            oom = _is_cuda_oom(exc)
+            # The traceback's frames hold the take's locals; clear them so
+            # the cleanup below can free what they reference.
+            traceback.clear_frames(exc.__traceback__)
+            if oom:
+                self._release_after_generation_oom()
+        finally:
+            _free_take_memory()
+            summary = _gpu_memory_summary()
+            if summary:
+                self._log(f"GPU after take: {summary}")
+
+    def _release_after_generation_oom(self) -> None:
+        """A generation ran out of CUDA memory. On handlers an earlier take
+        loaded, drop them so the next take reloads onto a clean GPU: one
+        ~90 s reload instead of a chain of failed takes (takes 12 and 13 of
+        session 5, 2026-10-16). On freshly loaded handlers, keep them."""
+        if not self._reused_handlers:
+            return
+        self._log("generation ran out of CUDA memory on reused handlers: "
+                  "releasing the loaded DiT/LM so the next take reloads them")
+        self._release_handlers()
+
+    def _run_take(self, input_path: str, params: dict) -> None:
+        """Generate, then score. Raises on failure; _execute cleans up."""
+        if AceStepHandler is None:
+            raise RuntimeError(
+                "ACE-Step 1.5 is installed but could not be imported by this runner. "
+                f"Underlying import error: {IMPORT_ERROR}"
+            )
+        output_dir = os.path.join(self._workdir, "output")
+        os.makedirs(output_dir, exist_ok=True)
+
+        dit_model = params.get("dit_model", DEFAULT_DIT_MODEL)
+        dit_handler, llm_handler = self._handlers(params)
+
+        task_type = params.get("task_type", "cover")
+        call_params = {
+            # Overridable so text2music can be run as a control: if the
+            # caption produces music from nothing but is ignored in cover
+            # mode, the problem is the cover path, not the prompt.
+            "task_type": task_type,
+            # src_audio is the song being covered; reference_audio is the
+            # STYLE it should take on. They are different inputs doing
+            # different jobs, which the source docstrings say plainly:
+            # reference_audio is "for style transfer or cover tasks",
+            # src_audio is "for audio-to-audio tasks".
+            #
+            # Setting both to the same file - which this did briefly -
+            # asks the model to make a track sound like itself, and it
+            # duly returns something close to the original. Pointing
+            # reference_audio at a track in the TARGET style is what
+            # actually transfers a style.
+            #
+            # Falls back to the source when no style reference is given,
+            # so a prompt-only cover still works.
+            "caption": params.get("prompt") or "",
+            # Left empty, ACE-Step renders the cover as an instrumental -
+            # the exact mistake that made job 20's vocals unintelligible.
+            "lyrics": params.get("lyrics") or "",
+            # Stated rather than inherited: this is what stops a repeat of
+            # job 20's clipping, so it should be visible at the call site.
+            "enable_normalization": True,
+            "normalization_db": -1.0,
+        }
+        # text2music generates from the caption alone. It is here as a
+        # control - "can this stack make music from nothing?" - and
+        # conditioning it on the very track under suspicion would defeat
+        # that, so the audio inputs are omitted entirely rather than
+        # passed and hopefully ignored.
+        if task_type != "text2music":
+            call_params["src_audio"] = input_path
+            # Only when a real style reference was given. This used to
+            # fall back to input_path, which set reference_audio ==
+            # src_audio and asked the model to make the track sound like
+            # itself - the trap this file already documents from job 74,
+            # walked into by the fallback itself. Job 78 came back as the
+            # source almost unchanged.
+            #
+            # With no reference, the caption is the only style signal,
+            # which is what a prompt-driven cover is meant to be.
+            if params.get("reference_path"):
+                call_params["reference_audio"] = params["reference_path"]
+            # Both of these only mean anything when there IS a source
+            # audio. cover_noise_strength is documented as "0=pure noise
+            # (no cover), 1=closest to src audio", and it also sets where
+            # on the schedule the diffusion starts - at 0.6 only 40% of
+            # the steps run.
+            #
+            # Sending it for text2music, which has no source, asked the
+            # sampler to start 60% of the way towards silence and then
+            # denoise for 3 of 8 steps. It returned very nearly what it
+            # started with: job 76 decoded to Peak=0.0041, which
+            # enable_normalization multiplied by ~217 to hit -1dB. That
+            # is the "noise" - not a bad generation, but silence with the
+            # gain turned all the way up.
+            call_params["audio_cover_strength"] = params.get(
+                "audio_cover_strength", DEFAULT_COVER_STRENGTH)
+            call_params["cover_noise_strength"] = params.get(
+                "cover_noise_strength", DEFAULT_COVER_NOISE_STRENGTH)
+
+        # Turbo's own schedule, unless the job explicitly says otherwise.
+        if "turbo" in dit_model:
+            call_params.update(TURBO_DEFAULTS)
+        for optional in OPTIONAL_PARAMS:
+            if optional in params:
+                call_params[optional] = params[optional]
+        # A cover always matches existing material, which is exactly when
+        # ACE-Step's tutorial says to set these anchors. Only the ones the
+        # caller left out; text2music has no source to measure.
+        if task_type != "text2music":
+            missing = [key for key in META_KEYS if key not in params]
+            if missing:
+                metas = self._estimate_metas(input_path)
+                for key in missing:
+                    if key in metas:
+                        call_params[key] = metas[key]
+
+        config = GenerationConfig(
+            # Default is 2, i.e. two full renders per call. We pay by the
+            # second and only ever retrieve one file.
+            batch_size=1,
+            # Default is flac; app/audio_quality.py reads 16-bit PCM wave,
+            # and it gates delivery.
+            audio_format="wav",
+        )
+
+        self._log("generation params: " + ", ".join(
+            f"{k}={v!r}" for k, v in sorted(call_params.items()) if k != "lyrics"))
+        self._log(f"lyrics: {len(call_params['lyrics'])} chars")
+        log_offset = self._agent_log_size()
+        result = generate_music(
+            dit_handler, llm_handler, GenerationParams(**call_params), config, save_dir=output_dir
+        )
+        success = bool(getattr(result, "success", False))
+        error = getattr(result, "error", "no error given")
+        audios = getattr(result, "audios", None) or []
+        self._log(f"generation returned success={getattr(result, 'success', None)!r} "
+                  f"audios={len(audios)}")
+        # Only the output path and the scorer's five tensors outlive the
+        # result. Everything else it holds - decoded audio, the other
+        # latents in extra_outputs - is dropped here, before the scorer
+        # asks for its ~8 GiB (session 5 OOMed scoring with 20.6 GiB
+        # still allocated).
+        path = audios[0]["path"] if success and audios else None
+        alignment_inputs = self._alignment_inputs(result, call_params) if path else None
+        del result, audios
+
+        if not success:
+            self._log(f"generation reported failure: {error}")
+            self._status = "failed"
+            self._output_path = None
+            if _is_cuda_oom(error):
+                self._release_after_generation_oom()
+            return
+
+        # Trust the filesystem over the reported path: a job that claims
+        # "done" with no retrievable audio is the worst outcome, because
+        # the orchestrator then destroys the instance.
+        if path and os.path.exists(path):
+            # Scored BEFORE status flips: the worker reads the scores the
+            # moment it sees "done". The peak is read last, after the file
+            # is written and the alignment is scored, to give ACE-Step's
+            # log line the most time to reach agent.log.
+            alignment_score = self._alignment_score(dit_handler, alignment_inputs, call_params)
+            del alignment_inputs
+            self._scores = {
+                "alignment_score": alignment_score,
+                "peak_before_norm": self._read_peak(log_offset),
+            }
+            self._log(f"scores: {self._scores}")
+            self._output_path = path
+            self._status = "done"
+        else:
+            self._log(f"generation reported success but no file at {path!r}")
+            self._status = "failed"
+            self._output_path = None
 
     def _load_handlers(self, dit_model: str, lm_model: str, lm_backend: str):
         """Build and initialise a DiT and LM. Raises if either fails."""
@@ -529,14 +640,10 @@ class AceStep15Runner(Runner):
         matches = PEAK_LINE_RE.findall(text)
         return float(matches[-1]) if matches else None
 
-    def _alignment_score(self, dit_handler, result, call_params: dict) -> float | None:
-        """ACE-Step's lyric alignment score for this take, or None.
-
-        generate_music does not compute it. ACE-Step's own UI does, by passing
-        the result's extra_outputs to get_lyric_score; its dit_score scores the
-        generated latent (lm_score is the pure-noise baseline). Never raises -
-        an unscored take is still a take.
-        """
+    def _alignment_inputs(self, result, call_params: dict) -> dict | None:
+        """The five tensors get_lyric_score needs, taken out of the result so
+        the result itself can be dropped before scoring. None when there is
+        nothing to score. Never raises."""
         if not (call_params.get("lyrics") or "").strip():
             return None
         try:
@@ -544,23 +651,65 @@ class AceStep15Runner(Runner):
             if any(extra.get(key) is None for key in ALIGNMENT_TENSOR_KEYS):
                 self._log("alignment: extra_outputs lacks the tensors to score with")
                 return None
-            outcome = dit_handler.get_lyric_score(
-                pred_latent=extra["pred_latents"][0:1],
-                encoder_hidden_states=extra["encoder_hidden_states"][0:1],
-                encoder_attention_mask=extra["encoder_attention_mask"][0:1],
-                context_latents=extra["context_latents"][0:1],
-                lyric_token_ids=extra["lyric_token_idss"][0:1],
-                vocal_language=call_params.get("vocal_language") or "en",
-                inference_steps=int(call_params.get("inference_steps", TURBO_DEFAULTS["inference_steps"])),
-                seed=ALIGNMENT_SEED,
-            )
+            # Sample 0 of each batch: batch_size is 1, so this is the take.
+            return {
+                "pred_latent": extra["pred_latents"][0:1],
+                "encoder_hidden_states": extra["encoder_hidden_states"][0:1],
+                "encoder_attention_mask": extra["encoder_attention_mask"][0:1],
+                "context_latents": extra["context_latents"][0:1],
+                "lyric_token_ids": extra["lyric_token_idss"][0:1],
+            }
+        except Exception as exc:
+            self._log(f"alignment: could not take the tensors to score with ({type(exc).__name__}: {exc})")
+            return None
+
+    def _alignment_score(self, dit_handler, inputs: dict | None, call_params: dict) -> float | None:
+        """ACE-Step's lyric alignment score for this take, or None.
+
+        generate_music does not compute it. ACE-Step's own UI does, by passing
+        the result's extra_outputs to get_lyric_score; its dit_score scores the
+        generated latent (lm_score is the pure-noise baseline). Never raises -
+        an unscored take is still a take, and an out-of-memory here frees what
+        it can and leaves the score None.
+        """
+        if inputs is None:
+            return None
+        try:
+            torch = _torch()
+            context = contextlib.nullcontext()
+            if torch is not None:
+                torch.cuda.empty_cache()
+                free, _total = torch.cuda.mem_get_info()
+                self._log(f"alignment: {free / GIB:.2f} GiB free on the GPU before scoring "
+                          f"(needs about {SCORER_NEEDS_GIB} GiB for a ~228 s source)")
+                # get_lyric_score carries @torch.inference_mode() upstream;
+                # stated here too so no autograd state is kept if that changes.
+                context = torch.inference_mode()
+            with context:
+                outcome = dit_handler.get_lyric_score(
+                    **inputs,
+                    vocal_language=call_params.get("vocal_language") or "en",
+                    inference_steps=int(call_params.get("inference_steps", TURBO_DEFAULTS["inference_steps"])),
+                    seed=ALIGNMENT_SEED,
+                )
             if not outcome.get("success"):
-                self._log(f"alignment: get_lyric_score failed: {outcome.get('error')}")
+                error = outcome.get("error")
+                self._log(f"alignment: get_lyric_score failed: {error}")
+                if _is_cuda_oom(error):
+                    self._scoring_oom()
                 return None
             return float(outcome["dit_score"])
         except Exception as exc:
             self._log(f"alignment: scoring raised {type(exc).__name__}: {exc}")
+            oom = _is_cuda_oom(exc)
+            traceback.clear_frames(exc.__traceback__)
+            if oom:
+                self._scoring_oom()
             return None
+
+    def _scoring_oom(self) -> None:
+        self._log("alignment: out of GPU memory; the take is kept without a score")
+        _collect_and_empty_cache()
 
     @staticmethod
     def _describe(path: str) -> str:
