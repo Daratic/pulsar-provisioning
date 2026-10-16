@@ -128,6 +128,7 @@ def _default_load(model_id: str):  # pragma: no cover - needs torch, transformer
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     model = MusicgenMelodyForConditionalGeneration.from_pretrained(model_id, torch_dtype=dtype).to(device)
     model.eval()
+    keep_conditioning_on_first_step(model)
     return {
         "tokenizer": tokenizer,
         "model": model,
@@ -136,6 +137,50 @@ def _default_load(model_id: str):  # pragma: no cover - needs torch, transformer
         "rate": int(model.config.audio_encoder.sampling_rate),
         "chroma_length": int(getattr(model.config, "chroma_length", CHROMA_LENGTH)),
     }
+
+
+def keep_conditioning_on_first_step(model):
+    """Make the text and the melody actually reach the decoder.
+
+    MusicGen-Melody conditions by PREFIXING the decoder input with the
+    projected chroma + text-encoder states on the first generation step;
+    later steps see them through the KV cache. In transformers 4.57 (and
+    from 4.55, when generate() began building the cache up front),
+    prepare_inputs_for_generation drops them whenever a cache object exists:
+
+        if past_key_values is not None:
+            ...
+            # we only want to use conditional signal in the 1st generation step ...
+            encoder_hidden_states = None
+
+    and the freshly built, still empty DynamicCache is not None on step 0.
+    So no step ever sees the conditioning: every caption and every melody
+    gave the same audio for the same seed (jobs 63/64, metal and gospel
+    byte-identical). Upstream main tests `not is_first_iteration` instead.
+
+    This wraps the instance's method: when the cache is still empty, the
+    conditioning computed by generate() is put back. On a fixed transformers
+    it is a no-op. Idempotent. Returns the model.
+    """
+    import functools
+
+    original = model.prepare_inputs_for_generation
+    if getattr(original, "_pulsar_keeps_conditioning", False):
+        return model
+
+    @functools.wraps(original)
+    def prepare(*args, **kwargs):
+        out = original(*args, **kwargs)
+        conditioning = kwargs.get("encoder_hidden_states")
+        cache = kwargs.get("past_key_values")
+        if (conditioning is not None and out.get("encoder_hidden_states") is None
+                and (cache is None or cache.get_seq_length() == 0)):
+            out["encoder_hidden_states"] = conditioning
+        return out
+
+    prepare._pulsar_keeps_conditioning = True
+    model.prepare_inputs_for_generation = prepare
+    return model
 
 
 def _default_generate(handle, audio, text, max_new_tokens, guidance_scale):  # pragma: no cover - needs torch
@@ -249,6 +294,10 @@ class MusicgenMelodyBacking(BackingEngine):
                     handle, melody[a:c], text, max_new_tokens=tokens, guidance_scale=guidance_scale
                 )
                 segment = fit_length(np.asarray(generated, dtype="float32").reshape(-1), c - a).copy()
+                # Raw model output level, before any fade: a peak at or over
+                # 1.0 or an RMS near it is noise or clipping, not a backing.
+                peak = float(np.max(np.abs(segment))) if segment.size else 0.0
+                rms = float(np.sqrt(np.mean(np.square(segment, dtype="float64")))) if segment.size else 0.0
                 if fade_in:
                     segment[:fade_in] *= np.sin(_ramp(fade_in) * (math.pi / 2))
                 fade_out = c - b
@@ -257,7 +306,7 @@ class MusicgenMelodyBacking(BackingEngine):
                 out[a:c] += segment
                 fade_in = fade_out
                 log(f"backing window {index + 1}/{len(spans)} {start:.2f}-{gen_end:.2f}s "
-                    f"({tokens} tokens) in {time.monotonic() - began:.1f}s")
+                    f"({tokens} tokens) in {time.monotonic() - began:.1f}s, raw peak {peak:.3f} rms {rms:.3f}")
         finally:
             del handle
             collect_and_empty_cache()
