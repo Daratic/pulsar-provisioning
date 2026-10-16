@@ -29,3 +29,8 @@ class Runner(ABC):
     def scores(self) -> dict:
         """Signals for ranking this runner's last output. Most runners have none."""
         return {}
+
+    def extra_outputs(self) -> dict[str, str]:
+        """Files besides the main output, name -> path. Names are basenames
+        (the agent serves them by name at /extra-output). Most runners have none."""
+        return {}

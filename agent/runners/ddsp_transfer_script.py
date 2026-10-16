@@ -19,7 +19,18 @@ import sys
 import time
 
 MODEL_SAMPLE_RATE = 16000
-CHECKPOINT = "ckpt-20000"
+# The checkpoint step differs per instrument (violin is 40000, the others
+# 20000), so the prefix is discovered from the one ckpt-*.index in the
+# model directory rather than assumed.
+
+
+def find_checkpoint(model_dir):
+    """The checkpoint prefix (path without .index) in model_dir, or None."""
+    import glob
+    indexes = sorted(glob.glob(os.path.join(model_dir, "ckpt-*.index")))
+    if not indexes:
+        return None
+    return indexes[-1][: -len(".index")]
 
 
 def parse_args(argv=None):
@@ -105,7 +116,9 @@ def transfer(args):
 
     model_dir = os.path.join(args.models_root, args.instrument)
     gin_file = os.path.join(model_dir, "operative_config-0.gin")
-    ckpt = os.path.join(model_dir, CHECKPOINT)
+    ckpt = find_checkpoint(model_dir)
+    if ckpt is None:
+        raise SystemExit("model file missing: no ckpt-*.index in " + model_dir)
     for needed in (gin_file, ckpt + ".index", os.path.join(model_dir, "dataset_statistics.pkl")):
         if not os.path.exists(needed):
             raise SystemExit("model file missing: " + needed)

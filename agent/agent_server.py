@@ -1,3 +1,5 @@
+import os
+
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel
@@ -121,7 +123,34 @@ def create_multi_runner_app(registry) -> FastAPI:
             raise HTTPException(status_code=404, detail="Output not ready")
         return FileResponse(path)
 
+    @agent_app.get("/extra-outputs")
+    def extra_outputs(runner: str) -> dict:
+        """Names of the files a runner made besides its output (the cover
+        pipeline's stems). Fetch each with /extra-output."""
+        return {"names": sorted(_runner(runner).extra_outputs())}
+
+    @agent_app.get("/extra-output")
+    def extra_output(runner: str, name: str) -> FileResponse:
+        # A bare file name only: the name comes off the network, and anything
+        # with a separator or a dot-dot is refused before it is looked up.
+        if not _is_basename(name):
+            raise HTTPException(status_code=400, detail="name must be a plain file name")
+        path = _runner(runner).extra_outputs().get(name)
+        if path is None or not os.path.isfile(path):
+            raise HTTPException(status_code=404, detail=f"No extra output {name!r}")
+        return FileResponse(path)
+
     return agent_app
+
+
+def _is_basename(name: str) -> bool:
+    return (
+        bool(name)
+        and name not in (".", "..")
+        and "/" not in name
+        and "\\" not in name
+        and "\x00" not in name
+    )
 
 
 # Entrypoint used by the agent Docker image's CMD (Task 10).

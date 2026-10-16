@@ -80,6 +80,12 @@ def default_factories(workdir: str = "/workspace") -> dict[str, Callable[[], Run
 
         return AudioToMidiRunner(workdir=workdir)
 
+    def _cover_pipeline():
+        # Light to import: every engine loads its libraries inside run().
+        from agent.runners.cover_pipeline import CoverPipelineRunner
+
+        return CoverPipelineRunner(workdir=workdir)
+
     return {
         "demucs": _demucs,
         "seed_vc": _seed_vc,
@@ -89,4 +95,5 @@ def default_factories(workdir: str = "/workspace") -> dict[str, Callable[[], Run
         "rave": _rave,
         "ddsp_timbre": _ddsp_timbre,
         "audio_to_midi": _audio_to_midi,
+        "cover_pipeline": _cover_pipeline,
     }

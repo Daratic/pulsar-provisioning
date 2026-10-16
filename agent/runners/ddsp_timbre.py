@@ -16,6 +16,25 @@ CHECKPOINT_FILES = (
     "ckpt-20000.data-00000-of-00001",
 )
 INSTRUMENTS = ("tenor_saxophone", "flute", "flute2", "trumpet", "violin")
+# The bucket holds one checkpoint step per instrument, and it is not the same
+# for all of them: violin is ckpt-40000 (job 60, 2026-10-16: 404 on 20000).
+# Listed from the GCS bucket on 2026-10-16.
+CHECKPOINT_STEPS = {"violin": 40000}
+DEFAULT_CHECKPOINT_STEP = 20000
+
+
+def checkpoint_step(instrument: str) -> int:
+    return CHECKPOINT_STEPS.get(instrument, DEFAULT_CHECKPOINT_STEP)
+
+
+def checkpoint_files(instrument: str) -> tuple[str, ...]:
+    step = checkpoint_step(instrument)
+    return (
+        "operative_config-0.gin",
+        "dataset_statistics.pkl",
+        f"ckpt-{step}.index",
+        f"ckpt-{step}.data-00000-of-00001",
+    )
 DEFAULT_INSTRUMENT = "tenor_saxophone"
 
 # TensorFlow 2.11 has wheels for Python 3.7-3.10 only, so DDSP lives in its
@@ -122,7 +141,7 @@ class DdspTimbreRunner(Runner):
         is never mistaken for a complete one."""
         model_dir = os.path.join(self._models_root, instrument)
         os.makedirs(model_dir, exist_ok=True)
-        for filename in CHECKPOINT_FILES:
+        for filename in checkpoint_files(instrument):
             target = os.path.join(model_dir, filename)
             if os.path.exists(target):
                 continue
