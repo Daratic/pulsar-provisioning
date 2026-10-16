@@ -17,6 +17,7 @@ pip install fastapi==0.115.0 'uvicorn[standard]==0.32.0' pydantic==2.9.2 soundfi
 pip install --no-deps basic-pitch
 python3 -c "from basic_pitch.inference import predict_and_save; from basic_pitch import ICASSP_2022_MODEL_PATH; print('basic-pitch import OK')"
 export PYTHONPATH=/opt/apps/pulsar
+python3 -c "import agent.agent_server_multi; print('agent import OK')"
 cat > /etc/supervisor/conf.d/pulsar-agent.conf <<'PULSAR_AGENT_CONF'
 [program:pulsar-agent]
 command=/bin/bash -c 'if [ -f /venv/main/bin/activate ]; then . /venv/main/bin/activate; fi; exec uvicorn agent.agent_server_multi:app --host 0.0.0.0 --port 8188'

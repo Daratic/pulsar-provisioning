@@ -17,6 +17,7 @@ pip install fastapi==0.115.0 'uvicorn[standard]==0.32.0' pydantic==2.9.2 soundfi
 git clone --depth 1 https://github.com/Plachtaa/seed-vc.git /opt/seed-vc || (sleep 5; rm -rf /opt/seed-vc; git clone --depth 1 https://github.com/Plachtaa/seed-vc.git /opt/seed-vc) || (sleep 15; rm -rf /opt/seed-vc; git clone --depth 1 https://github.com/Plachtaa/seed-vc.git /opt/seed-vc)
 pip install -r /opt/seed-vc/requirements.txt
 export PYTHONPATH=/opt/seed-vc:/opt/apps/pulsar
+python3 -c "import agent.agent_server_multi; print('agent import OK')"
 cat > /etc/supervisor/conf.d/pulsar-agent.conf <<'PULSAR_AGENT_CONF'
 [program:pulsar-agent]
 command=/bin/bash -c 'if [ -f /venv/main/bin/activate ]; then . /venv/main/bin/activate; fi; exec uvicorn agent.agent_server_multi:app --host 0.0.0.0 --port 8188'

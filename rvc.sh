@@ -22,6 +22,7 @@ python3 -c "from huggingface_hub import hf_hub_download; hf_hub_download('lj1995
 python3 -c "from huggingface_hub import hf_hub_download; hf_hub_download('lj1995/VoiceConversionWebUI', 'rmvpe.pt', local_dir='/opt/rvc/assets/rmvpe')"
 python3 -c "import os; os.chdir('/opt/rvc'); from infer.vc.modules import VC; from configs.config import Config; print('rvc import OK')"
 export PYTHONPATH=/opt/rvc:/opt/apps/pulsar
+python3 -c "import agent.agent_server_multi; print('agent import OK')"
 cat > /etc/supervisor/conf.d/pulsar-agent.conf <<'PULSAR_AGENT_CONF'
 [program:pulsar-agent]
 command=/bin/bash -c 'if [ -f /venv/main/bin/activate ]; then . /venv/main/bin/activate; fi; exec uvicorn agent.agent_server_multi:app --host 0.0.0.0 --port 8188'
