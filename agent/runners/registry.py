@@ -70,6 +70,11 @@ def default_factories(workdir: str = "/workspace") -> dict[str, Callable[[], Run
 
         return RaveRunner(workdir=workdir)
 
+    def _ddsp_timbre():
+        from agent.runners.ddsp_timbre import DdspTimbreRunner
+
+        return DdspTimbreRunner(workdir=workdir)
+
     def _audio_to_midi():
         from agent.runners.audio_to_midi import AudioToMidiRunner
 
@@ -82,5 +87,6 @@ def default_factories(workdir: str = "/workspace") -> dict[str, Callable[[], Run
         "ace_step_15": _ace_step_15,
         "rvc": _rvc,
         "rave": _rave,
+        "ddsp_timbre": _ddsp_timbre,
         "audio_to_midi": _audio_to_midi,
     }
