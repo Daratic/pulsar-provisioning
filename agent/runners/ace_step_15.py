@@ -113,7 +113,35 @@ OPTIONAL_PARAMS = (
     "latent_rescale",
     "fade_in_duration",
     "fade_out_duration",
+    "thinking",
+    "use_cot_metas",
+    "use_cot_caption",
+    "use_cot_language",
+    "instruction",
+    "repainting_start",
+    "repainting_end",
 )
+
+# Tasks that only work if the DiT actually sees the source audio. Both are
+# Base-model-only (upstream docs/en/INFERENCE.md sections 4 and 6).
+SOURCE_CONDITIONED_TASKS = ("complete", "lego")
+LEGO_TRACKS = ("vocals", "backing_vocals", "drums", "bass", "guitar", "keyboard",
+               "percussion", "strings", "synth", "fx", "brass", "woodwinds")
+DEFAULT_COMPLETE_TRACKS = "drums, bass, guitar, keyboard"
+
+
+def _source_duration_seconds(path: str) -> float | None:
+    """Length of the source in seconds, or None when it cannot be read.
+
+    A take without a duration is still a take (the model then picks its own
+    length), so this never raises.
+    """
+    try:
+        import soundfile as sf
+        return float(sf.info(path).duration)
+    except Exception as exc:
+        print(f"could not read the source duration of {path}: {exc}")
+        return None
 
 # Estimated from the source for a cover when the caller did not set them.
 META_KEYS = ("bpm", "keyscale", "timesignature")
@@ -369,9 +397,19 @@ class AceStep15Runner(Runner):
         os.makedirs(output_dir, exist_ok=True)
 
         dit_model = params.get("dit_model", DEFAULT_DIT_MODEL)
+        task_type = params.get("task_type", "cover")
+        # Refused before any model loads: a rejected job should cost nothing.
+        lego_track = None
+        if task_type in SOURCE_CONDITIONED_TASKS:
+            if "turbo" in dit_model:
+                raise ValueError(f"{task_type} needs a base DiT "
+                                 f"(acestep-v15-base or acestep-v15-xl-base), not {dit_model}")
+            if task_type == "lego":
+                lego_track = params.get("track_name")
+                if lego_track not in LEGO_TRACKS:
+                    raise ValueError(f"lego needs track_name, one of {', '.join(LEGO_TRACKS)}")
         dit_handler, llm_handler = self._handlers(params)
 
-        task_type = params.get("task_type", "cover")
         call_params = {
             # Overridable so text2music can be run as a control: if the
             # caption produces music from nothing but is ignored in cover
@@ -433,8 +471,33 @@ class AceStep15Runner(Runner):
             # gain turned all the way up.
             call_params["audio_cover_strength"] = params.get(
                 "audio_cover_strength", DEFAULT_COVER_STRENGTH)
-            call_params["cover_noise_strength"] = params.get(
-                "cover_noise_strength", DEFAULT_COVER_NOISE_STRENGTH)
+            if task_type not in SOURCE_CONDITIONED_TASKS:
+                # A cover-schedule knob; meaningless for complete/lego.
+                call_params["cover_noise_strength"] = params.get(
+                    "cover_noise_strength", DEFAULT_COVER_NOISE_STRENGTH)
+
+        if task_type in SOURCE_CONDITIONED_TASKS:
+            # Job 67 (2026-10-16): complete ran with the 5Hz LM on. Upstream
+            # logged "Audio codes provided, ignoring src_audio and using codes
+            # instead" - the DiT never saw the vocal and the result was 258 s
+            # of text-to-music. The LM is skipped only when ALL FOUR are off
+            # (acestep/inference.py: use_lm = thinking or any use_cot_*).
+            call_params["thinking"] = False
+            call_params["use_cot_metas"] = False
+            call_params["use_cot_caption"] = False
+            call_params["use_cot_language"] = False
+            if task_type == "complete":
+                tracks = params.get("complete_tracks") or DEFAULT_COMPLETE_TRACKS
+                call_params["instruction"] = f"Complete the input track with {tracks}:"
+            else:
+                call_params["instruction"] = f"Generate the {lego_track} track based on the audio context:"
+            # Without a duration the model picks its own (258 s for a 229 s song).
+            if "duration" not in params:
+                seconds = _source_duration_seconds(input_path)
+                if seconds is not None:
+                    call_params["duration"] = seconds
+                else:
+                    self._log("source duration unreadable: leaving duration to the model")
 
         # Turbo's own schedule, unless the job explicitly says otherwise.
         if "turbo" in dit_model:

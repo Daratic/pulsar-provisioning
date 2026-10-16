@@ -43,7 +43,7 @@ from agent.runners.cover_engines import (
     StageLog,
     collect_and_empty_cache,
 )
-from agent.runners.cover_engines.analysis import measure_bpm_key
+from agent.runners.cover_engines.analysis import beat_alignment, measure_bpm_key
 from agent.runners.cover_engines.audio import audio_duration, fit_file_to_seconds
 from agent.runners.cover_engines.voice import DIFFUSION_STEPS_RANGE, SEMITONE_RANGE, _int_param
 
@@ -60,6 +60,10 @@ CONVERTED_MIN_FRACTION = 0.5
 
 _TRUE = {"1", "true", "on", "yes"}
 _FALSE = {"0", "false", "off", "no"}
+
+
+# Onset correlation at and above this means the backing's beat is locked.
+BEAT_LOCKED_CORR = 0.25
 
 
 def free_memory() -> None:
@@ -127,6 +131,7 @@ class _Plan:
     bpm: float | None
     keyscale: str | None
     timesig: int | None
+    min_beat_alignment: float
 
 
 class _StageFailed(Exception):
@@ -270,6 +275,9 @@ class CoverPipelineRunner(Runner):
         if _number(params, "window_seconds", 30.0) <= 0:
             raise ValueError(f"window_seconds must be positive, got {params['window_seconds']!r}")
         _number(params, "guidance_scale", 3.0)
+        min_beat_alignment = _number(params, "min_beat_alignment", 0.0)
+        if not 0.0 <= min_beat_alignment <= 1.0:
+            raise ValueError(f"min_beat_alignment must be between 0 and 1, got {params['min_beat_alignment']!r}")
         if _given(params, "seed"):
             try:
                 int(str(params["seed"]).strip())
@@ -292,6 +300,7 @@ class CoverPipelineRunner(Runner):
             vocal_level_db=vocal_level_db, melody_source=melody_source, separator=names["separator"],
             backing_engine=names["backing_engine"], voice_engine=voice, mixer=names["mixer"],
             bpm=bpm, keyscale=keyscale, timesig=timesig,
+            min_beat_alignment=min_beat_alignment,
         )
 
     def _run_stages(self, input_path: str, plan: _Plan, params: dict) -> str:
@@ -309,8 +318,8 @@ class CoverPipelineRunner(Runner):
 
         # 3 backing
         melody = {"instrumental": instrumental, "mix": input_path, "vocals": vocals}[plan.melody_source]
-        backing = self._stage(3, lambda: self._engine("backing_engine", plan.backing_engine).run(
-            melody, plan.caption, bpm, keyscale, timesig, target_seconds, params, job, log
+        backing = self._stage(3, lambda: self._backing(
+            melody, instrumental, plan, bpm, keyscale, timesig, target_seconds, params, log
         ))
         self._add_extra({"backing.wav": backing})
 
@@ -334,6 +343,29 @@ class CoverPipelineRunner(Runner):
             return out
 
         return self._stage(5, mix_stage)
+
+    def _backing(self, melody, instrumental, plan, bpm, keyscale, timesig, target_seconds, params, log):
+        backing = self._engine("backing_engine", plan.backing_engine).run(
+            melody, plan.caption, bpm, keyscale, timesig, target_seconds, params, self._job_dir, log
+        )
+        # Measure whether the new backing plays the song's rhythm. A backing
+        # whose beat phase is unrelated to the song leaves the vocal out of
+        # sync (covers 65/66). A measuring fault never fails the job.
+        try:
+            result = beat_alignment(instrumental, backing)
+        except Exception as exc:
+            self._log(f"beat alignment could not be measured: {type(exc).__name__}: {exc}")
+            return backing
+        corr = result["onset_corr"]
+        log(f"backing beat alignment: onset corr {corr:.3f}, mean best lag "
+            f"{result['best_lag_ms']:.0f} ms ({result['windows']} windows)")
+        if corr < BEAT_LOCKED_CORR:
+            self._note(f"backing is not beat-locked to the song (onset corr {corr:.2f})")
+        if plan.min_beat_alignment > 0 and corr < plan.min_beat_alignment:
+            raise RuntimeError(
+                f"backing beat alignment {corr:.2f} below min_beat_alignment {plan.min_beat_alignment:.2f}"
+            )
+        return backing
 
     def _analyse(self, instrumental: str, plan: _Plan, log: StageLog):
         # The length comes from the separator's WAV, not the upload: the
