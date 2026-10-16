@@ -81,6 +81,11 @@ DEFAULT_COVER_STRENGTH = 0.5
 # default. It also silently truncates the schedule (0.6 left 3 of 8 steps),
 # so every cover after it was a brief touch-up of the original and came back
 # sounding exactly like the source: jobs 74, 78, 79 and 82.
+#
+# 0.0 is only this agent's fallback, for a caller that sends nothing. It is
+# not what Pulsar sends: app/runner_schemas.py defaults cover_noise_strength
+# to 0.15, and the UI and take sets fill schema defaults into every request,
+# so a Pulsar cover runs at 0.15 unless the user changes it.
 DEFAULT_COVER_NOISE_STRENGTH = 0.0
 
 # Forwarded only when the job sets them, so anything unspecified keeps
@@ -158,6 +163,9 @@ class AceStep15Runner(Runner):
         # One runner object serves a whole session, so these are reset at the
         # start of every take - a failed take must not show the last one's.
         self._scores: dict = {}
+        # Source metas by (path, mtime): N takes of one source pay for the
+        # librosa analysis once, and a replaced source is analysed again.
+        self._metas_cache: dict[tuple[str, int], dict] = {}
         self._agent_log_path = os.path.join(workdir, "agent.log")
         self._sleep = time.sleep  # replaced in tests
 
@@ -167,6 +175,7 @@ class AceStep15Runner(Runner):
         # readable by the first poll after a new dispatch.
         self._status = "running"
         self._output_path = None
+        self._scores = {}
         threading.Thread(target=self._execute, args=(input_path, params), daemon=True).start()
 
     def _execute(self, input_path: str, params: dict) -> None:
@@ -389,13 +398,27 @@ class AceStep15Runner(Runner):
             return 0
 
     def _estimate_metas(self, input_path: str) -> dict:
-        """Never raises: a take without anchors is still a take."""
+        """Never raises: a take without anchors is still a take.
+
+        Cached per (path, mtime). A failed estimate is not cached, so the next
+        take tries again; a source whose mtime cannot be read is not cached.
+        """
+        try:
+            key = (input_path, os.stat(input_path).st_mtime_ns)
+        except OSError:
+            key = None
+        if key is not None and key in self._metas_cache:
+            metas = self._metas_cache[key]
+            self._log(f"metas reused for this source: {metas}")
+            return dict(metas)
         try:
             metas = estimate_metas(input_path)
         except Exception as exc:
             self._log(f"metas: could not estimate from the source ({type(exc).__name__}: {exc})")
             return {}
         self._log(f"metas estimated from the source: {metas}")
+        if key is not None:
+            self._metas_cache[key] = dict(metas)
         return metas
 
     def _read_peak(self, offset: int) -> float | None:

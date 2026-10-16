@@ -74,12 +74,19 @@ def estimate_key(chroma_profile: Sequence[float]) -> str:
     return max(KEY_PROFILES, key=lambda name: _pearson(values, KEY_PROFILES[name]))
 
 
-def bpm_from_tempo(tempo) -> int:
+def bpm_from_tempo(tempo) -> int | None:
+    """ACE-Step's bpm for a librosa tempo, or None when there is no tempo.
+
+    librosa reports 0 (or NaN) when it finds no beat at all. That means "no
+    bpm", not a 30 bpm anchor the model would then follow.
+    """
     # librosa 0.11 returns tempo as a one-element array; older ones, a float.
     try:
         value = float(tempo)
     except TypeError:
         value = float(tempo[0])
+    if math.isnan(value) or value <= 0:
+        return None
     return int(min(BPM_MAX, max(BPM_MIN, round(value))))
 
 
@@ -91,8 +98,8 @@ def estimate_metas(path: str, librosa_module=None) -> dict:
     tempo, _beats = librosa.beat.beat_track(y=y, sr=sr)
     chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
     profile = [float(v) for v in chroma.mean(axis=1)]
-    return {
-        "bpm": bpm_from_tempo(tempo),
-        "keyscale": estimate_key(profile),
-        "timesignature": DEFAULT_TIME_SIGNATURE,
-    }
+    metas = {"keyscale": estimate_key(profile), "timesignature": DEFAULT_TIME_SIGNATURE}
+    bpm = bpm_from_tempo(tempo)
+    if bpm is not None:
+        metas = {"bpm": bpm, **metas}
+    return metas
