@@ -109,6 +109,7 @@ OPTIONAL_PARAMS = (
     "shift",
     "sampler_mode",
     "cover_noise_strength",
+    "dcw_enabled",
     "latent_shift",
     "latent_rescale",
     "fade_in_duration",
@@ -505,6 +506,13 @@ class AceStep15Runner(Runner):
         for optional in OPTIONAL_PARAMS:
             if optional in params:
                 call_params[optional] = params[optional]
+        if task_type in SOURCE_CONDITIONED_TASKS:
+            # Job 70: the page default (0.15) rides in via params above; >0 re-noises
+            # the SOURCE latents, so complete started from the vocal itself.
+            if call_params.pop("cover_noise_strength", None) is not None:
+                self._log("complete/lego: cover_noise_strength dropped (it re-noises from the source)")
+            # Upstream PR #1266: DCW (default on) turns lego/complete output to noise.
+            call_params.setdefault("dcw_enabled", False)
         # A cover always matches existing material, which is exactly when
         # ACE-Step's tutorial says to set these anchors. Only the ones the
         # caller left out; text2music has no source to measure.
